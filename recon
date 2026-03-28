@@ -1,0 +1,158 @@
+#!/bin/bash
+
+if [ -z "$1" ]; then
+    echo "Usage: recon <subdomain> OR recon <file.txt>"
+    exit 1
+fi
+
+INPUT="$1"
+
+if [ -f "$INPUT" ]; then
+    echo "[*] File provided. Starting dynamic bulk queue mode..."
+    while [ -s "$INPUT" ]; do
+        CURRENT_SUB=$(head -n 1 "$INPUT")
+        
+        if [ -z "$CURRENT_SUB" ]; then
+            sed -i '1d' "$INPUT"
+            continue
+        fi
+        
+        "$0" "$CURRENT_SUB"
+        
+        echo "[*] Sleeping for 60 seconds before the next subdomain (Press Ctrl+C to stop)..."
+        sleep 60
+    done
+    echo "[+] Queue is empty. Bulk recon finished!"
+    exit 0
+fi
+
+SUB="$INPUT"
+
+SUB="$1"
+ALL_SUBS_FILE="$(pwd)/all_subs.txt"
+WORDLIST="/usr/share/seclists/Discovery/Web-Content/DirBuster-2007_directory-list-2.3-small.txt"
+
+FINISH_FILE="$(pwd)/finish.txt"
+
+trap 'if [ -f "$ALL_SUBS_FILE" ]; then grep -v "^$SUB$" "$ALL_SUBS_FILE" > "$ALL_SUBS_FILE.tmp" && mv "$ALL_SUBS_FILE.tmp" "$ALL_SUBS_FILE"; fi' EXIT
+
+if grep -qx "$SUB" "$FINISH_FILE" 2>/dev/null; then
+    echo "[!] You tested this subdomain before ($SUB) and it's located in finish.txt."
+    echo "[!] The script will stop so as not to repeat the work."
+    exit 0
+fi
+
+
+echo "[*] Starting recon on: $SUB"
+
+DIR_NAME="$SUB"
+
+STATUS=$(echo "$SUB" | httpx-toolkit -silent -status-code)
+
+if [ -z "$STATUS" ]; then
+    echo "[-] $SUB seems to be NXDOMAIN or unreachable."
+    mkdir -p "$DIR_NAME"
+    cd "$DIR_NAME" || exit
+    subzy run --targets "$SUB" --hide_fails > subzy.txt
+    echo "[*] subzy finished. Exiting script for this subdomain."
+    echo "$SUB" >> "$FINISH_FILE"
+    exit 0
+fi
+
+SUB_STATUS_CODE=$(echo "$STATUS" | head -n 1 | awk '{print $2}' | tr -d '[]')
+echo "[+] $SUB is alive with status: $SUB_STATUS_CODE"
+
+echo "[*] Running enum_subs.sh..."
+enum_subs "$SUB"
+
+cd "$DIR_NAME" || exit
+
+if [ -f "all_subs.txt" ]; then
+    echo "[*] Merging new subdomains into the master list..."
+    cat all_subs.txt >> "$ALL_SUBS_FILE"
+    sort -u "$ALL_SUBS_FILE" -o "$ALL_SUBS_FILE"
+    rm all_subs.txt
+fi
+
+echo "[*] Running Crawling and Fuzzing (Katana, FFuf, Waymore)..."
+katana -u "https://$SUB" -silent -c 20 > katana_links.txt
+ffuf -u "https://$SUB/FUZZ" -w "$WORDLIST" -mc all -s -fc 404 -t 30 | awk -v base="https://$SUB/" '{print base$1}' > ffuf_links.txt
+waymore -i "$SUB" -mode U -oU waymore_links.txt 2>/dev/null
+
+echo "[*] Consolidating and deduplicating all gathered links..."
+cat katana_links.txt ffuf_links.txt waymore_links.txt 2>/dev/null | sort -u > all_links_unique.txt
+
+echo "[*] Checking status codes for all unique links..."
+cat all_links_unique.txt | httpx-toolkit -silent -status-code -t 50 -rl 150 > httpx_links_status.txt
+
+echo "[*] Categorizing links into 2xx, 3xx, 4xx, 5xx, and js..."
+grep -E '\[2[0-9]{2}\]' httpx_links_status.txt | awk '{print $1}' > 2xx_links.txt
+grep -E '\[3[0-9]{2}\]' httpx_links_status.txt | awk '{print $1}' > 3xx_links.txt
+grep -E '\[4[0-9]{2}\]' httpx_links_status.txt | awk '{print $1}' > 4xx_links.txt
+grep -E '\[5[0-9]{2}\]' httpx_links_status.txt | awk '{print $1}' > 5xx_links.txt
+grep "\.js" httpx_links_status.txt | awk '{print $1}' > js_links.txt
+
+echo "[*] Deleting httpx_links_status.txt..."
+rm httpx_links_status.txt
+
+echo "[*] Routing main subdomain (Status: $SUB_STATUS_CODE) to its family..."
+case "$SUB_STATUS_CODE" in
+    2*) echo "https://$SUB" >> 2xx_links.txt ;;
+    3*) echo "https://$SUB" >> 3xx_links.txt ;;
+    4*) echo "https://$SUB" >> 4xx_links.txt ;;
+    5*) echo "https://$SUB" >> 5xx_links.txt ;;
+esac
+
+for f in 2xx_links.txt 3xx_links.txt 4xx_links.txt 5xx_links.txt js_links.txt; do
+    if [ -f "$f" ]; then sort -u "$f" -o "$f"; fi
+done
+
+echo "[*] Running Scans (Nuclei, nomore403, LinkFinder)..."
+
+touch nuclei_2xx_results.txt nuclei_30x_results.txt nuclei_40x_results.txt nuclei_50x_results.txt nuclei_js_results.txt
+touch nomore403_links_results.txt linkfinder_js.txt 2xx_links.txt js_links.txt
+
+[ -s 2xx_links.txt ] && nuclei -l 2xx_links.txt -silent -rl 100 -c 30 > nuclei_2xx_results.txt
+
+[ -s 3xx_links.txt ] && nuclei -l 3xx_links.txt -tags redirect,crlf -silent -rl 100 -c 30 > nuclei_30x_results.txt
+
+[ -s 5xx_links.txt ] && nuclei -l 5xx_links.txt -tags exposure,debug,error -silent -rl 100 -c 30 > nuclei_50x_results.txt
+
+if [ -s 4xx_links.txt ]; then
+    nuclei -l 4xx_links.txt -tags bypass -silent -rl 100 -c 30 > nuclei_40x_results.txt
+    while read -r url; do
+        nomore403 -u "$url" >> nomore403_links_results.txt
+    done < 40x_links.txt
+fi
+
+if [ -s js_links.txt ]; then
+    nuclei -l js_links.txt -tags token,key,api -silent > nuclei_js_results.txt
+    while read -r js_url; do
+        linkfinder -i "$js_url" -o cli >> linkfinder_js.txt
+    done < js_links.txt
+fi
+
+echo "[*] Finalizing and cleaning up strictly to 9 files..."
+
+if [ -f 2xx_links.txt ]; then
+    grep -v "^https://$SUB$" 2xx_links.txt > temp_2xx.txt && mv temp_2xx.txt 2xx_links.txt
+fi
+
+rm -f katana_links.txt ffuf_links.txt waymore_links.txt all_links_unique.txt 3xx_links.txt 4xx_links.txt 5xx_links.txt temp_2xx.txt
+
+echo "[*] Adding $SUB to finish.txt..."
+echo "$SUB" >> "$FINISH_FILE"
+
+echo "[+] Done! Directory cleaned. You now have exactly the 9 requested files."
+
+echo "[*] Cleaning up empty files..."
+find . -maxdepth 1 -type f -empty -delete
+
+echo "[*] Checking if directory is empty..."
+if [ -z "$(ls -A .)" ]; then
+    echo "[-] No findings for $SUB. Deleting empty directory..."
+    cd ..
+    rmdir "$DIR_NAME"
+else
+    echo "[+] Done! Valid findings saved in $DIR_NAME."
+fi

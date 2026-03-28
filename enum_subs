@@ -1,0 +1,41 @@
+#!/bin/bash
+
+if [ -z "$1" ]; then
+    echo "Usage: enum_subs <domain.com>"
+    exit 1
+fi
+
+DOMAIN="$1"
+WORDLIST="/usr/share/seclists/Discovery/DNS/subdomains-top1million-110000.txt"
+RESOLVERS="/home/kali/Desktop/bbh/wordlist/resolvers.txt" 
+
+echo "[*] Starting comprehensive enumeration for: $DOMAIN"
+
+DIR_NAME="$DOMAIN"
+mkdir -p "$DIR_NAME"
+cd "$DIR_NAME" || exit
+
+echo "[*] Phase 1: Passive Enumeration (subfinder & assetfinder)..."
+subfinder -d "$DOMAIN" -all -silent | tee passive_subfinder.txt
+assetfinder -subs-only "$DOMAIN" | tee passive_assetfinder.txt
+
+cat passive_*.txt | sort -u > passive_all.txt
+echo "[+] Passive enumeration found $(wc -l < passive_all.txt) subdomains."
+
+echo "[*] Phase 2: Active Brute-Forcing with puredns..."
+puredns bruteforce "$WORDLIST" "$DOMAIN" -r "$RESOLVERS" -l 200 | tee active_brute.txt
+echo "[+] Brute-forcing found $(wc -l < active_brute.txt) resolved subdomains."
+
+echo "[*] Phase 3: Generating and resolving permutations..."
+cat passive_all.txt active_brute.txt | sort -u > combined_for_mutations.txt
+
+dnsgen combined_for_mutations.txt 2>/dev/null | puredns resolve -r "$RESOLVERS" -l 200 | tee active_permutations.txt
+echo "[+] Permutations found $(wc -l < active_permutations.txt) valid subdomains."
+
+echo "[*] Consolidating all results into all_subs.txt..."
+cat passive_all.txt active_brute.txt active_permutations.txt | sort -u > all_subs.txt
+
+rm -f passive_subfinder.txt passive_assetfinder.txt passive_all.txt active_brute.txt combined_for_mutations.txt active_permutations.txt
+
+echo "[+] Done! Total unique subdomains ready for recon: $(wc -l < all_subs.txt)"
+echo "[*] File saved as: $DIR_NAME/all_subs.txt"
